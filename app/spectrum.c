@@ -17,6 +17,7 @@
 #include "app/spectrum.h"
 #include "am_fix.h"
 #include "audio.h"
+#include "chFrScanner.h"
 #include "driver/backlight.h"
 #include "frequencies.h"
 #include "ui/helper.h"
@@ -260,12 +261,22 @@ static void ResetPeak() {
 }
 
 bool IsCenterMode() { return settings.scanStepIndex < S_STEP_2_5kHz; }
-uint8_t GetStepsCount() { return 128 >> settings.stepsCount; }
+// scan step in 0.01khz
 uint16_t GetScanStep() { return scanStepValues[settings.scanStepIndex]; }
+uint16_t GetStepsCount() 
+{ 
+  if(gScanRangeStart) {
+    return (gEeprom.VfoInfo[!vfo].pRX->Frequency - gScanRangeStart) / GetScanStep();
+  }
+  return 128 >> settings.stepsCount;
+}
 uint32_t GetBW() { return GetStepsCount() * GetScanStep(); }
-uint32_t GetFStart() {
+
+uint32_t GetFStart()
+{
   return IsCenterMode() ? currentFreq - (GetBW() >> 1) : currentFreq;
 }
+
 uint32_t GetFEnd() { return currentFreq + GetBW(); }
 
 static void TuneToPeak() {
@@ -340,6 +351,7 @@ static void ResetScanStats() {
 
 static void InitScan() {
   ResetScanStats();
+  memset(rssiHistory, 0, sizeof(rssiHistory));
   scanInfo.i = 0;
   scanInfo.f = GetFStart();
 
@@ -398,7 +410,18 @@ static void UpdatePeakInfo() {
     UpdatePeakInfoForce();
 }
 
-static void Measure() { rssiHistory[scanInfo.i] = scanInfo.rssi = GetRssi(); }
+static void Measure() 
+{ 
+  uint16_t rssi = scanInfo.rssi = GetRssi();
+  if(scanInfo.measurementsCount <= 128) {
+    rssiHistory[scanInfo.i] = rssi;
+  }
+  else {
+    uint8_t idx = (uint32_t)ARRAY_SIZE(rssiHistory) * 1000 / scanInfo.measurementsCount * scanInfo.i / 1000;
+    if(rssiHistory[idx] < rssi)
+      rssiHistory[idx] = rssi;
+  }
+}
 
 // Update things by keypress
 
@@ -932,7 +955,7 @@ static void RenderStatus() {
 
 static void RenderSpectrum() {
   DrawTicks();
-  DrawArrow(peak.i << settings.stepsCount);
+  DrawArrow(128u * peak.i / GetStepsCount());
   DrawSpectrum();
   DrawRssiTriggerLevel();
   DrawF(peak.f);
@@ -1135,6 +1158,19 @@ static void Tick() {
   }
 #endif
 
+  if (gNextTimeslice_500ms) {
+    gNextTimeslice_500ms = false;
+
+    redrawScreen = true;
+
+    UpdatePeakInfo();
+    if (IsPeakOverLevel()) {
+      ToggleRX(true);
+      TuneToPeak();
+      return;
+    }
+  }
+
   if (!preventKeypress) {
     HandleUserInput();
   }
@@ -1166,24 +1202,29 @@ void APP_RunSpectrum() {
   // TX here coz it always? set to active VFO
   vfo = gEeprom.TX_VFO;
   // set the current frequency in the middle of the display
-  currentFreq = initialFreq = gEeprom.VfoInfo[vfo].pRX->Frequency -
-                              ((GetStepsCount() / 2) * GetScanStep());
+  if(gScanRangeStart) {
+    currentFreq = initialFreq = gScanRangeStart;
+    settings.stepsCount = STEPS_128;
+  }
+  else
+    currentFreq = initialFreq = gEeprom.VfoInfo[vfo].pRX->Frequency -
+                                ((GetStepsCount() / 2) * GetScanStep());
 
   BackupRegisters();
 
   isListening = true; // to turn off RX later
   redrawStatus = true;
-  redrawScreen = false; // we will wait until scan done
+  redrawScreen = true; // we will wait until scan done
   newScanStart = true;
 
+
+
   ToggleRX(true), ToggleRX(false); // hack to prevent noise when squelch off
-  RADIO_SetModulation(settings.modulationType = gRxVfo->Modulation);
+  RADIO_SetModulation(settings.modulationType = gTxVfo->Modulation);
 
   BK4819_SetFilterBandwidth(settings.listenBw = BK4819_FILTER_BW_WIDE, false);
 
   RelaunchScan();
-
-  memset(rssiHistory, 0, sizeof(rssiHistory));
 
   isInitialized = true;
 
